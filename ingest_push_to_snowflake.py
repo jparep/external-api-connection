@@ -1,18 +1,21 @@
-# ingest_push_to_snowflake.py
-
-import snowflake.connector
 import pandas as pd
+import snowflake.connector
 import requests
 import hashlib
 import json
 import os
 from datetime import datetime
-from io import StringIO
 from dotenv import load_dotenv
 
+# ✅ Patch: Force-load pandas into the connector before write_pandas is called
+import snowflake.connector.pandas_tools as sfpt
+sfpt.pd = pd
+write_pandas = sfpt.write_pandas
+
+# Load environment variables
 load_dotenv()
 
-# Establish connection using .env credentials
+# Snowflake connection
 conn = snowflake.connector.connect(
     user=os.getenv("SNOWFLAKE_USER"),
     password=os.getenv("SNOWFLAKE_PASSWORD"),
@@ -34,17 +37,18 @@ def ingest_api_to_snowflake():
         response = requests.get(api_url, timeout=10)
         response.raise_for_status()
         json_data = response.json()
+        json_data = json_data[:5]  # ✅ LIMIT to 5 records for testing
         api_fingerprint = compute_hash(response.text)
 
         print("✅ API call succeeded.")
 
-        # Step 2: Prepare data
+        # Step 2: Prepare and enrich data
         df = pd.json_normalize(json_data)
         df.columns = [c.upper().replace(" ", "_") for c in df.columns]
         df["_INGEST_TS"] = datetime.utcnow()
         df["RECORD_HASH"] = [compute_hash(rec) for rec in json_data]
 
-        # Step 3: Filter out existing hashes
+        # Step 3: Filter existing hashes
         existing_hashes = set()
         cursor.execute("SELECT RECORD_HASH FROM RAW.RAW_JSON.RECORD_HASH_TRACKER")
         for row in cursor.fetchall():
@@ -53,11 +57,13 @@ def ingest_api_to_snowflake():
         df_filtered = df[~df["RECORD_HASH"].isin(existing_hashes)]
         print(f"🔍 {len(df_filtered)} new records identified.")
 
-        # Step 4: Insert raw JSON archive using bind parameters
+        # Step 4: Insert raw JSON archive
         insert_sql = """
             INSERT INTO RAW.RAW_JSON.RAW_JSON_ARCHIVE
             (id, raw_payload, api_id, api_fingerprint, record_hash, status)
-            VALUES (%s, PARSE_JSON(%s), %s, %s, %s, %s)
+            SELECT v1, PARSE_JSON(v2), v3, v4, v5, v6
+            FROM VALUES (%s, %s, %s, %s, %s, %s)
+            AS t(v1, v2, v3, v4, v5, v6)
         """
 
         for i, row in df_filtered.iterrows():
@@ -71,7 +77,7 @@ def ingest_api_to_snowflake():
                 'fetched'
             ))
 
-        # Step 5: Insert flattened data into table (auto-create if needed)
+        # Step 5: Create flattened table dynamically
         table_name = "COVID_STATS_GENERIC"
         create_cols = []
         for col, dtype in df_filtered.dtypes.items():
@@ -90,8 +96,8 @@ def ingest_api_to_snowflake():
         create_sql = f"CREATE TABLE IF NOT EXISTS RAW.RAW_JSON.{table_name} ({', '.join(create_cols)})"
         cursor.execute(create_sql)
 
-        # Step 6: Write to flattened table
-        success, nchunks, nrows, _ = snowflake.connector.pandas_tools.write_pandas(
+        # Step 6: Insert flat data using write_pandas
+        success, nchunks, nrows, _ = write_pandas(
             conn,
             df_filtered,
             table_name=table_name,
@@ -101,7 +107,7 @@ def ingest_api_to_snowflake():
         )
         print(f"📦 {nrows} flattened rows inserted into {table_name}")
 
-        # Step 7: Insert hashes into tracker
+        # Step 7: Track record hashes
         for rh in df_filtered["RECORD_HASH"].tolist():
             cursor.execute("""
                 INSERT INTO RAW.RAW_JSON.RECORD_HASH_TRACKER (record_hash, record_source)
@@ -125,4 +131,4 @@ def ingest_api_to_snowflake():
 if __name__ == "__main__":
     print("🚀 Script started...")
     ingest_api_to_snowflake()
-    
+    print("✅ Script completed.")
